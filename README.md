@@ -362,6 +362,74 @@ ta = TradingAgentsGraph(config=config)
 _, decision = ta.propagate("NVDA", "2026-09-01")
 ```
 
+## 1-Hour intraday and scalping pipeline (crypto)
+
+The default pipeline reasons over daily bars. A separate, opt-in 1H pipeline trades `BTCUSDT` on hourly candles using a **two-tier hierarchical engine**, because an LLM deliberation takes 15–45 seconds and cannot be in the path of a scalp:
+
+- **Strategic layer (hourly, LLM).** The multi-agent graph runs once per closed 1H candle and emits a regime bias (`LONG` / `SHORT` / `FLAT`), an ATR volatility band and invalidation levels.
+- **Tactical layer (arithmetic only).** `tradingagents/scalping/` sizes the position, sets ATR brackets and resolves exits with no LLM in the loop.
+- **Safety gatekeeper.** `run_1h_backtest.py` must be run and explicitly approved before anything can reach the exchange.
+
+### Install
+
+```bash
+pip install -e ".[binance]"      # core + python-binance
+cp .env.example .env             # then fill in the keys below
+```
+
+Set in `.env`:
+
+```bash
+GOOGLE_API_KEY=...
+BINANCE_API_KEY=...
+BINANCE_SECRET_KEY=...
+BINANCE_ENV=testnet
+TRADINGAGENTS_LLM_PROVIDER=google
+TRADINGAGENTS_QUICK_THINK_MODEL=gemini-1.5-flash   # analysts
+TRADINGAGENTS_DEEP_THINK_MODEL=gemini-1.5-pro      # debate, risk, portfolio manager
+TRADINGAGENTS_DEEP_DELIBERATION=true               # put the debate on the Pro tier
+```
+
+Testnet keys come from [testnet.binance.vision](https://testnet.binance.vision) and are **not** interchangeable with live keys.
+
+### Run the backtest (required before trading)
+
+```bash
+python run_1h_backtest.py                       # 60 days of BTCUSDT 1H
+python run_1h_backtest.py --days 30             # shorter window
+python run_1h_backtest.py --no-short            # long-only, as a spot account is
+python run_1h_backtest.py --csv bars.csv        # offline, where Binance is blocked
+```
+
+It replays the window at $10,000 starting equity, risking 2% per trade at a 1.5×ATR stop with a 3×ATR target, and prints ending capital, net return against buy & hold, win rate, profit factor, max drawdown, Sharpe and Sortino (annualized over 8,760 hourly periods), and the last five trades. It then asks:
+
+```
+Do you approve these backtest metrics to proceed with Binance connection? (y/n):
+```
+
+Anything other than `y` — including a non-interactive stdin — exits without touching the exchange.
+
+The bias driving the replay is the deterministic `TrendBiasModel`, not the agent graph: replaying 1,440 hourly bars through a multi-agent debate would cost thousands of LLM calls and would not reproduce between runs, so it could not serve as a gate. The backtest validates sizing, brackets, fees and exit precedence; the agents supply direction live.
+
+### Test connectivity
+
+```bash
+python binance_executor.py --check                     # credentials, filters, balance
+python binance_executor.py --dry-run BUY --quantity 0.01 --stop-price 58000
+```
+
+`--check` and `--dry-run` never place an order.
+
+### Execution guardrails
+
+`binance_executor.py` is the only module that can move funds, and its limits are hardcoded rather than configurable, because they exist to bound a *model* failure — a limit the agent could raise would be no limit at all:
+
+- `exchangeInfo` filters (`LOT_SIZE`, `PRICE_FILTER`, `NOTIONAL`) are fetched from the venue, and every quantity and price is truncated **down** to `stepSize` / `tickSize` using `Decimal`.
+- Single-order notional is capped at the lesser of **$1,000** and **20% of account equity**.
+- Orders below the venue's `minNotional` are rejected locally and never sent.
+- A `BUY` attaches its stop immediately after the fill (OCO, falling back to `STOP_LOSS_LIMIT`); if the stop cannot be placed, the failure is raised loudly rather than leaving an unprotected position.
+- `SELL` cancels resting orders and closes the position; `HOLD` places nothing.
+
 ## Evaluating decisions over time
 
 One run gives one decision, which cannot tell you whether the system decides well. `run_backtest` runs the same pipeline over a grid of tickers and dates, writes to a memory log of its own, and scores the decisions whose holding window has since traded.

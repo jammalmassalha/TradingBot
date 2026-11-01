@@ -41,6 +41,13 @@ dev = [
 bedrock = [
     "langchain-aws>=1.7.9",
 ]
+# Binance 1H intraday/scalping pipeline (run_1h_backtest.py, binance_executor.py).
+# Optional so the core install stays lean, and so a user who only runs the daily
+# equities flow never installs an exchange trading client:
+#   pip install "tradingagents[binance]"
+binance = [
+    "python-binance>=1.0.19",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"

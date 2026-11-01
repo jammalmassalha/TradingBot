@@ -9,6 +9,11 @@ _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
 # their .env file.
 _ENV_OVERRIDES = {
     "TRADINGAGENTS_LLM_PROVIDER":         "llm_provider",
+    # ``*_MODEL`` aliases for the canonical ``*_LLM`` names below. Listed first
+    # so that when both spellings are set, the canonical one wins (overrides are
+    # applied in iteration order).
+    "TRADINGAGENTS_DEEP_THINK_MODEL":     "deep_think_llm",
+    "TRADINGAGENTS_QUICK_THINK_MODEL":    "quick_think_llm",
     "TRADINGAGENTS_DEEP_THINK_LLM":       "deep_think_llm",
     "TRADINGAGENTS_QUICK_THINK_LLM":      "quick_think_llm",
     "TRADINGAGENTS_DEEP_THINK_PROVIDER":       "deep_think_provider",
@@ -21,6 +26,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_MAX_TOOL_ROUNDS":      "max_tool_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
+    "TRADINGAGENTS_DEEP_DELIBERATION":    "deep_deliberation",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
@@ -126,6 +132,11 @@ def build_default_config() -> dict:
         # Checkpoint/resume: when True, LangGraph saves state after each node
         # so a crashed run can resume from the last successful step.
         "checkpoint_enabled": False,
+        # When True the bull/bear researchers and the three risk debators run on
+        # the deep tier instead of the quick one. Off by default: a debate is
+        # many turns and the deep model is the costly one. The 1H pipeline turns
+        # it on, where a wrong hourly call outweighs the extra tokens.
+        "deep_deliberation": False,
         # Output language for analyst reports and final decision
         # Internal agent debate stays in English for reasoning quality
         "output_language": "English",

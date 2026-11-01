@@ -98,6 +98,7 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.conditional_logic,
             max_tool_rounds,
+            deep_deliberation=bool(self.config.get("deep_deliberation", False)),
         )
 
         self.propagator = Propagator(
