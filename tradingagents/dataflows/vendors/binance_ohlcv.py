@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
 BINANCE_REST_BASE = "https://api.binance.com"
 KLINES_PATH = "/api/v3/klines"
 
+# USD-M perpetuals live on a different host with a different path. A perp does
+# not track its spot pair exactly — basis and funding pull them apart — so a
+# strategy that will trade the perp must be backtested on perp candles, not on
+# spot ones that merely look similar.
+BINANCE_FUTURES_REST_BASE = "https://fapi.binance.com"
+FUTURES_KLINES_PATH = "/fapi/v1/klines"
+
+SPOT_MARKET = "spot"
+FUTURES_MARKET = "futures"
+
 # Binance caps a single klines response at 1000 rows, so any window longer than
 # ~41 days of hourly bars must be paginated.
 MAX_KLINES_PER_REQUEST = 1000
@@ -100,6 +110,28 @@ def resolve_symbol(symbol: str | None = None) -> str:
     return DEFAULT_SYMBOL
 
 
+MARKET_ENV_VAR = "BINANCE_MARKET"
+VALID_MARKETS = (SPOT_MARKET, FUTURES_MARKET)
+# Spellings people reasonably use for the USD-M perpetual venue.
+_FUTURES_ALIASES = frozenset({"futures", "perp", "perps", "perpetual", "usdm", "usd-m", "fapi"})
+
+
+def resolve_market(market: str | None = None) -> str:
+    """``spot`` or ``futures``: explicit argument, else ``BINANCE_MARKET``, else spot.
+
+    Spot is the default so that nothing starts trading leveraged contracts
+    because a variable was left unset.
+    """
+    chosen = (market or os.getenv(MARKET_ENV_VAR) or SPOT_MARKET).strip().lower()
+    if chosen in _FUTURES_ALIASES:
+        chosen = FUTURES_MARKET
+    if chosen not in VALID_MARKETS:
+        raise ValueError(
+            f"market must be one of {VALID_MARKETS}, got {chosen!r}"
+        )
+    return chosen
+
+
 # Indicator parameters. Centralized so the backtest, the executor and the
 # agent-facing report all size positions off exactly the same ATR.
 EMA_PERIODS = (20, 50, 200)
@@ -127,7 +159,19 @@ def format_hour(moment: datetime) -> str:
     return floor_to_hour(moment).strftime(HOUR_FORMAT)
 
 
-def _request_klines(symbol: str, interval: str, start_ms: int, limit: int) -> list[list[Any]]:
+def _klines_endpoint(market: str) -> str:
+    """The klines URL for ``market``; unknown markets are a programming error."""
+    if market == FUTURES_MARKET:
+        return f"{BINANCE_FUTURES_REST_BASE}{FUTURES_KLINES_PATH}"
+    if market == SPOT_MARKET:
+        return f"{BINANCE_REST_BASE}{KLINES_PATH}"
+    raise ValueError(f"market must be 'spot' or 'futures', got {market!r}")
+
+
+def _request_klines(
+    symbol: str, interval: str, start_ms: int, limit: int,
+    market: str = SPOT_MARKET,
+) -> list[list[Any]]:
     """One page of raw klines, with transport failures mapped to the vendor taxonomy.
 
     Binance answers a bad symbol with HTTP 400 and a JSON body, which is a
@@ -143,7 +187,7 @@ def _request_klines(symbol: str, interval: str, start_ms: int, limit: int) -> li
     }
     try:
         response = requests.get(
-            f"{BINANCE_REST_BASE}{KLINES_PATH}",
+            _klines_endpoint(market),
             params=params,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
@@ -176,6 +220,7 @@ def fetch_klines(
     interval: str = "1h",
     days: int = 60,
     end: datetime | None = None,
+    market: str = SPOT_MARKET,
 ) -> pd.DataFrame:
     """``days`` of ``interval`` candles for ``symbol``, oldest first.
 
@@ -201,7 +246,7 @@ def fetch_klines(
     rows: list[list[Any]] = []
     cursor = start_ms
     while cursor <= last_open_ms:
-        page = _request_klines(symbol, interval, cursor, MAX_KLINES_PER_REQUEST)
+        page = _request_klines(symbol, interval, cursor, MAX_KLINES_PER_REQUEST, market)
         if not page:
             break
         rows.extend(page)
@@ -322,6 +367,7 @@ def load_1h_ohlcv(
     days: int = 60,
     end: datetime | None = None,
     with_indicators: bool = True,
+    market: str = SPOT_MARKET,
 ) -> pd.DataFrame:
     """The 1H bar series for ``symbol``, indicators attached, oldest first.
 
@@ -333,7 +379,7 @@ def load_1h_ohlcv(
     differently-parameterized ATRs.
     """
     symbol = resolve_symbol(symbol)
-    frame = fetch_klines(symbol=symbol, interval="1h", days=days, end=end)
+    frame = fetch_klines(symbol=symbol, interval="1h", days=days, end=end, market=market)
     return compute_indicators(frame) if with_indicators else frame
 
 

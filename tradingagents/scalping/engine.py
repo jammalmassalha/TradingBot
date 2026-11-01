@@ -52,6 +52,14 @@ class BacktestConfig:
     # simulator never borrows: a low-ATR bar can otherwise imply a position many
     # times the account, which no spot venue would fill.
     max_notional_pct: float = 100.0
+    # Perpetual-futures economics. Both default to the spot case (no leverage,
+    # no funding) so an existing spot run produces byte-identical results.
+    leverage: float = 1.0
+    # Funding is exchanged every 8h on a perp. Charged to whichever side holds
+    # the position regardless of sign: the rate flips with the market, and a
+    # gate should assume the unfavourable regime rather than model a carry
+    # income it cannot count on.
+    funding_bps_per_8h: float = 0.0
 
     def __post_init__(self) -> None:
         if self.initial_balance <= 0:
@@ -64,6 +72,15 @@ class BacktestConfig:
             raise ValueError("atr_target_multiple must be positive")
         if self.fee_bps < 0:
             raise ValueError("fee_bps cannot be negative")
+        if self.leverage < 1:
+            raise ValueError(f"leverage must be at least 1, got {self.leverage}")
+        if self.funding_bps_per_8h < 0:
+            raise ValueError("funding_bps_per_8h cannot be negative")
+
+    @property
+    def funding_bps_per_hour(self) -> float:
+        """The 8-hourly funding rate spread across the hourly bars it covers."""
+        return self.funding_bps_per_8h / 8.0
 
 
 @dataclass
@@ -158,7 +175,10 @@ def position_size(
     if stop_distance <= 0:
         return 0.0
     quantity = (equity * config.risk_pct / 100.0) / stop_distance
-    max_notional = equity * config.max_notional_pct / 100.0
+    # Leverage widens the notional ceiling, not the risk budget: the stop
+    # distance still decides the size, and leverage only decides whether the
+    # venue will carry it.
+    max_notional = equity * config.max_notional_pct / 100.0 * config.leverage
     return min(quantity, max_notional / price)
 
 
@@ -271,6 +291,11 @@ def run_backtest(
 
         if open_trade is not None:
             bars_in_market += 1
+            # Funding accrues for every hour the position is carried, which is
+            # what makes a leveraged perp expensive to hold through a chop.
+            open_trade.fees += (
+                open_trade.notional * config.funding_bps_per_hour / 10_000.0
+            )
         marked = equity + (open_trade.unrealized(close) if open_trade else 0.0)
         equity_curve.append(max(marked, 0.0))
 

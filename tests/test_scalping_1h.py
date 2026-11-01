@@ -566,7 +566,7 @@ def test_backtest_cli_rejects_a_malformed_symbol(capsys, monkeypatch):
     import run_1h_backtest
     monkeypatch.delenv("TRADING_SYMBOL", raising=False)
     assert run_1h_backtest.main(["--symbol", "NOT A PAIR"]) == 1
-    assert "Invalid --symbol" in capsys.readouterr().err
+    assert "not a valid Binance pair ticker" in capsys.readouterr().err
 
 
 def test_notional_is_hard_capped_at_1000_usd():
@@ -639,3 +639,286 @@ def test_live_environment_must_be_spelled_correctly():
     from binance_executor import BinanceExecutor
     with pytest.raises(ValueError, match="testnet"):
         BinanceExecutor(env="production")
+
+
+# --- USD-M perpetual futures ------------------------------------------------
+
+
+class FakeFutures:
+    """A stand-in futures client exposing only what the executor reads."""
+
+    def __init__(self, price="100", available="13", position="0",
+                 step="0.001", min_qty="0.001", min_notional="5",
+                 base_asset="BTC", quote_asset="USDT", status="TRADING"):
+        self._price, self._available, self._position = price, available, position
+        self._symbol = {
+            "symbol": "BTCUSDT", "status": status,
+            "baseAsset": base_asset, "quoteAsset": quote_asset,
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": step,
+                 "minQty": min_qty, "maxQty": "1000"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                {"filterType": "MIN_NOTIONAL", "notional": min_notional},
+            ],
+        }
+        self.orders: list[dict] = []
+        self.leverage_calls: list[dict] = []
+        self.margin_calls: list[dict] = []
+        self.cancelled = 0
+
+    def futures_ping(self):
+        return {}
+
+    def futures_exchange_info(self):
+        return {"symbols": [self._symbol]}
+
+    def futures_mark_price(self, symbol):
+        return {"symbol": symbol, "markPrice": self._price}
+
+    def futures_account_balance(self):
+        return [{"asset": "USDT", "availableBalance": self._available,
+                 "balance": self._available}]
+
+    def futures_position_information(self, symbol):
+        return [{"symbol": symbol, "positionAmt": self._position}]
+
+    def futures_change_leverage(self, symbol, leverage):
+        self.leverage_calls.append({"symbol": symbol, "leverage": leverage})
+        return {}
+
+    def futures_change_margin_type(self, symbol, marginType):
+        self.margin_calls.append({"symbol": symbol, "marginType": marginType})
+        return {}
+
+    def futures_create_order(self, **kwargs):
+        self.orders.append(kwargs)
+        return {"orderId": len(self.orders), **kwargs}
+
+    def futures_cancel_all_open_orders(self, symbol):
+        self.cancelled += 1
+        return {}
+
+
+def futures_with(client, **kwargs):
+    from binance_executor import BinanceFuturesExecutor
+    executor = BinanceFuturesExecutor(
+        symbol="BTCUSDT", env="testnet", api_key="k", api_secret="s", **kwargs
+    )
+    executor._client = client
+    return executor
+
+
+def test_futures_reads_the_futures_wallet_not_the_spot_balance():
+    """The -2015 the user hit came from asking spot about futures funds."""
+    executor = futures_with(FakeFutures(available="13"))
+    assert executor.get_equity() == Decimal("13")
+
+
+def test_market_is_resolved_from_the_environment(monkeypatch):
+    from binance_executor import (
+        BinanceExecutor,
+        BinanceFuturesExecutor,
+        build_executor,
+    )
+    monkeypatch.delenv("BINANCE_MARKET", raising=False)
+    assert isinstance(build_executor(env="testnet"), BinanceExecutor)
+    for spelling in ("futures", "perp", "USD-M"):
+        monkeypatch.setenv("BINANCE_MARKET", spelling)
+        assert isinstance(build_executor(env="testnet"), BinanceFuturesExecutor)
+
+
+def test_leverage_is_clamped_to_the_hard_cap():
+    from binance_executor import MAX_LEVERAGE
+    executor = futures_with(FakeFutures(), leverage=125)
+    assert executor.leverage == MAX_LEVERAGE
+
+
+def test_margin_fraction_is_clamped_to_the_hard_cap():
+    from binance_executor import MAX_MARGIN_FRACTION
+    executor = futures_with(FakeFutures(), margin_fraction=Decimal("0.99"))
+    assert executor.margin_fraction == MAX_MARGIN_FRACTION
+
+
+def test_leverage_multiplies_the_notional_ceiling_not_the_wallet():
+    """13 USDT at 7x and a 20% margin fraction buys 18.20 of notional."""
+    executor = futures_with(FakeFutures(available="13"), leverage=7,
+                            margin_fraction=Decimal("0.20"))
+    assert executor.cap_notional(Decimal("10000"), Decimal("13")) == Decimal("18.20")
+
+
+def test_unreadable_equity_still_bounds_the_futures_notional():
+    from binance_executor import MAX_TRADE_NOTIONAL_USD
+    executor = futures_with(FakeFutures(), leverage=10)
+    assert executor.cap_notional(Decimal("999999"), None) == MAX_TRADE_NOTIONAL_USD
+
+
+def test_position_quantity_keeps_the_short_sign():
+    """Collapsing the sign would make a short look like a long."""
+    executor = futures_with(FakeFutures(position="-0.5"))
+    assert executor.get_position_quantity() == Decimal("-0.5")
+
+
+def test_sell_closes_rather_than_opening_a_leveraged_short():
+    executor = futures_with(FakeFutures(position="0.5"))
+    result = executor.execute("SELL", dry_run=True)
+    assert result["status"] == "DRY_RUN"
+    assert result["side"] == "SELL"
+    assert result["quantity"] == "0.5"
+
+
+def test_short_requires_the_explicit_action():
+    executor = futures_with(FakeFutures(price="100", available="100"), leverage=5)
+    plan = executor.execute("SHORT", quantity=0.1, stop_price=101, dry_run=True)
+    assert plan["position"] == "SHORT"
+    assert plan["side"] == "SELL"
+
+
+def test_opening_into_an_opposite_position_is_refused():
+    from binance_executor import ExecutionRejected
+    executor = futures_with(FakeFutures(position="0.5", available="1000"))
+    with pytest.raises(ExecutionRejected, match="opposite"):
+        executor.execute("SHORT", quantity=0.1, stop_price=200)
+
+
+def test_stop_on_the_wrong_side_of_entry_is_refused():
+    from binance_executor import ExecutionRejected
+    executor = futures_with(FakeFutures(price="100", available="1000"))
+    with pytest.raises(ExecutionRejected, match="at or above entry"):
+        executor.execute("BUY", quantity=0.1, stop_price=101)
+
+
+def test_stop_beyond_liquidation_is_refused():
+    """A stop the venue would never reach is not a stop."""
+    from binance_executor import ExecutionRejected
+    # 13 USDT backing 0.9 of notional at 100 => liquidation ~ far; make the
+    # position large relative to equity so liquidation sits close in.
+    executor = futures_with(FakeFutures(price="100", available="13"),
+                            leverage=10, margin_fraction=Decimal("0.5"))
+    with pytest.raises(ExecutionRejected, match="liquidation-safe"):
+        executor.execute("BUY", quantity=0.65, stop_price=50)
+
+
+def test_entry_attaches_a_close_position_stop():
+    executor = futures_with(FakeFutures(price="100", available="1000"), leverage=5)
+    executor.execute("BUY", quantity=0.1, stop_price=95, take_profit=110)
+    types = [o["type"] for o in executor.client.orders]
+    assert types == ["MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET"]
+    stop = executor.client.orders[1]
+    assert stop["closePosition"] is True
+    assert stop["side"] == "SELL"
+    assert stop["workingType"] == "MARK_PRICE"
+
+
+def test_a_failed_stop_is_reported_not_swallowed():
+    from binance_executor import ExecutionRejected
+
+    class StopFails(FakeFutures):
+        def futures_create_order(self, **kwargs):
+            if kwargs.get("type") == "STOP_MARKET":
+                raise RuntimeError("venue said no")
+            return super().futures_create_order(**kwargs)
+
+    executor = futures_with(StopFails(price="100", available="1000"), leverage=5)
+    with pytest.raises(ExecutionRejected, match="stop could not be placed"):
+        executor.execute("BUY", quantity=0.1, stop_price=95)
+
+
+def test_leverage_and_margin_mode_are_configured_before_the_entry():
+    executor = futures_with(FakeFutures(price="100", available="1000"),
+                            leverage=7, margin_mode="CROSS")
+    executor.execute("BUY", quantity=0.1, stop_price=95)
+    assert executor.client.leverage_calls == [{"symbol": "BTCUSDT", "leverage": 7}]
+    assert executor.client.margin_calls == [
+        {"symbol": "BTCUSDT", "marginType": "CROSSED"}
+    ]
+
+
+def test_margin_type_already_set_is_not_an_error():
+    class AlreadyCrossed(FakeFutures):
+        def futures_change_margin_type(self, symbol, marginType):
+            raise RuntimeError("APIError(code=-4046): No need to change margin type.")
+
+    executor = futures_with(AlreadyCrossed(price="100", available="1000"))
+    assert executor.configure_account()["margin_mode"] == "CROSSED"
+
+
+def test_check_reports_when_the_wallet_cannot_afford_one_lot():
+    """13 USDT at 7x cannot fund 0.001 BTC at 100k; say so before ordering."""
+    client = FakeFutures(price="100000", available="13", min_qty="0.001")
+    executor = futures_with(client, leverage=7, margin_fraction=Decimal("0.20"))
+    report = executor.check_connectivity()
+    assert report["tradable"] == "no"
+    assert "smallest order" in report["why_not"]
+
+
+def test_check_reports_tradable_for_an_affordable_contract():
+    client = FakeFutures(price="0.15", available="13", min_qty="1", min_notional="5")
+    executor = futures_with(client, leverage=7, margin_fraction=Decimal("0.20"))
+    assert executor.check_connectivity()["tradable"] == "yes"
+
+
+def test_non_usd_margined_contract_is_refused():
+    from binance_executor import ExecutionRejected
+    executor = futures_with(FakeFutures(quote_asset="BTC"))
+    with pytest.raises(ExecutionRejected, match="USD-margined"):
+        executor.load_filters()
+
+
+def test_delisted_contract_is_refused():
+    from binance_executor import ExecutionRejected
+    executor = futures_with(FakeFutures(status="SETTLING"))
+    with pytest.raises(ExecutionRejected, match="not trading"):
+        executor.load_filters()
+
+
+def test_spot_executor_rejects_leverage_settings():
+    from binance_executor import build_executor
+    with pytest.raises(ValueError, match="only valid when"):
+        build_executor(env="testnet", market="spot", leverage=7)
+
+
+def test_minus_2015_diagnosis_names_the_wallet_mismatch():
+    import argparse
+
+    import binance_executor
+    args = argparse.Namespace(market="spot", env="testnet")
+    text = binance_executor._diagnose(
+        "APIError(code=-2015): Invalid API-key, IP, or permissions for action.", args
+    )
+    assert "BINANCE_MARKET=futures" in text
+    args = argparse.Namespace(market="futures", env="testnet")
+    text = binance_executor._diagnose("APIError(code=-2015): Invalid API-key", args)
+    assert "testnet.binancefuture.com" in text
+
+
+def test_futures_klines_use_the_fapi_endpoint():
+    from tradingagents.dataflows.vendors.binance_ohlcv import _klines_endpoint
+    assert "fapi.binance.com/fapi/v1/klines" in _klines_endpoint("futures")
+    assert "api.binance.com/api/v3/klines" in _klines_endpoint("spot")
+
+
+def test_funding_is_charged_for_every_hour_held():
+    from tradingagents.scalping.engine import BacktestConfig
+    config = BacktestConfig(funding_bps_per_8h=8.0)
+    assert config.funding_bps_per_hour == 1.0
+
+
+def test_funding_reduces_a_winning_trade():
+    """A carry cost must show up in the gate's numbers, not be assumed away."""
+    from tradingagents.scalping.engine import BacktestConfig, run_backtest
+    # A slow grind up: the position is carried for many hours without the
+    # target firing, which is exactly when funding bites.
+    frame = make_frame([100.0 + i * 0.05 for i in range(80)])
+    free = run_backtest(frame, FixedBias(Bias.LONG), BacktestConfig(fee_bps=0.0))
+    paid = run_backtest(frame, FixedBias(Bias.LONG),
+                        BacktestConfig(fee_bps=0.0, funding_bps_per_8h=200.0))
+    assert paid.equity_curve[-1] < free.equity_curve[-1]
+
+
+def test_leverage_widens_the_notional_ceiling():
+    from tradingagents.scalping.engine import BacktestConfig, position_size
+    spot = BacktestConfig(max_notional_pct=100.0)
+    perp = BacktestConfig(max_notional_pct=100.0, leverage=7.0)
+    # A tiny ATR makes the notional cap, not the risk budget, the binding rule.
+    args = (10_000.0, 0.01, 100.0)
+    assert position_size(*args, perp) == pytest.approx(position_size(*args, spot) * 7)
