@@ -99,12 +99,26 @@ class GraphSetup:
         deep_thinking_llm: Any,
         conditional_logic: ConditionalLogic,
         max_tool_rounds: int,
+        deep_deliberation: bool = False,
     ):
-        """Initialize with required components."""
+        """Initialize with required components.
+
+        ``deep_deliberation`` moves the bull/bear researchers and the three risk
+        debators onto the deep tier. They default to the quick tier because a
+        debate is many turns and the deep model is the expensive one; a short
+        intraday horizon inverts that trade-off, since one bad hourly call costs
+        more than the extra tokens (see ``run_1h_backtest.py``).
+        """
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
         self.conditional_logic = conditional_logic
         self.max_tool_rounds = max_tool_rounds
+        self.deep_deliberation = deep_deliberation
+
+    @property
+    def _deliberation_llm(self) -> Any:
+        """The tier the debate and risk-arbitration agents run on."""
+        return self.deep_thinking_llm if self.deep_deliberation else self.quick_thinking_llm
 
     def setup_graph(
         self, selected_analysts=("market", "social", "news", "fundamentals"), memory_node=None
@@ -129,14 +143,14 @@ class GraphSetup:
             "fundamentals": lambda: create_fundamentals_analyst(self.quick_thinking_llm),
         }
 
-        bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
-        bear_researcher_node = create_bear_researcher(self.quick_thinking_llm)
+        bull_researcher_node = create_bull_researcher(self._deliberation_llm)
+        bear_researcher_node = create_bear_researcher(self._deliberation_llm)
         research_manager_node = create_research_manager(self.deep_thinking_llm)
         trader_node = create_trader(self.quick_thinking_llm)
 
-        aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
-        neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
-        conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
+        aggressive_analyst = create_aggressive_debator(self._deliberation_llm)
+        neutral_analyst = create_neutral_debator(self._deliberation_llm)
+        conservative_analyst = create_conservative_debator(self._deliberation_llm)
         portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
 
         workflow = StateGraph(AgentState)
