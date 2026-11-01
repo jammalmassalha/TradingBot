@@ -364,7 +364,7 @@ _, decision = ta.propagate("NVDA", "2026-09-01")
 
 ## 1-Hour intraday and scalping pipeline (crypto)
 
-The default pipeline reasons over daily bars. A separate, opt-in 1H pipeline trades `BTCUSDT` on hourly candles using a **two-tier hierarchical engine**, because an LLM deliberation takes 15–45 seconds and cannot be in the path of a scalp:
+The default pipeline reasons over daily bars. A separate, opt-in 1H pipeline trades a configurable crypto pair (`BTCUSDT` by default) on hourly candles using a **two-tier hierarchical engine**, because an LLM deliberation takes 15–45 seconds and cannot be in the path of a scalp:
 
 - **Strategic layer (hourly, LLM).** The multi-agent graph runs once per closed 1H candle and emits a regime bias (`LONG` / `SHORT` / `FLAT`), an ATR volatility band and invalidation levels.
 - **Tactical layer (arithmetic only).** `tradingagents/scalping/` sizes the position, sets ATR brackets and resolves exits with no LLM in the loop.
@@ -388,6 +388,7 @@ TRADINGAGENTS_LLM_PROVIDER=google
 TRADINGAGENTS_QUICK_THINK_MODEL=gemini-1.5-flash   # analysts
 TRADINGAGENTS_DEEP_THINK_MODEL=gemini-1.5-pro      # debate, risk, portfolio manager
 TRADINGAGENTS_DEEP_DELIBERATION=true               # put the debate on the Pro tier
+TRADING_SYMBOL=BTCUSDT                             # the pair to trade
 ```
 
 Testnet keys come from [testnet.binance.vision](https://testnet.binance.vision) and are **not** interchangeable with live keys.
@@ -395,7 +396,8 @@ Testnet keys come from [testnet.binance.vision](https://testnet.binance.vision) 
 ### Run the backtest (required before trading)
 
 ```bash
-python run_1h_backtest.py                       # 60 days of BTCUSDT 1H
+python run_1h_backtest.py                       # 60 days of $TRADING_SYMBOL 1H
+python run_1h_backtest.py --symbol ETHUSDT      # override the pair for one run
 python run_1h_backtest.py --days 30             # shorter window
 python run_1h_backtest.py --no-short            # long-only, as a spot account is
 python run_1h_backtest.py --csv bars.csv        # offline, where Binance is blocked
@@ -415,8 +417,15 @@ The bias driving the replay is the deterministic `TrendBiasModel`, not the agent
 
 ```bash
 python binance_executor.py --check                     # credentials, filters, balance
+python binance_executor.py --check --symbol SOLUSDT    # a different pair
 python binance_executor.py --dry-run BUY --quantity 0.01 --stop-price 58000
 ```
+
+### Choosing the coin
+
+Set `TRADING_SYMBOL` in `.env` to change the pair everywhere, or pass `--symbol` to override it for a single run. The name is normalized, so `eth-usdt` and `ETHUSDT` are the same pair, and a malformed ticker fails immediately instead of as an opaque HTTP 400.
+
+The pair must be quoted in a USD stablecoin (`USDT`, `USDC`, `FDUSD`, `BUSD`, `TUSD`, `DAI`). The $1,000 per-trade cap is denominated in dollars, so on a pair like `ETHBTC` it would read as 1,000 BTC — the executor refuses such pairs rather than applying a cap that does not mean what it says. Base and quote assets are read from `exchangeInfo`, not inferred from the ticker, so balances are always checked against the assets actually being traded.
 
 `--check` and `--dry-run` never place an order.
 

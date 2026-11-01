@@ -468,9 +468,12 @@ class FakeFilters:
     """A stand-in client exposing only what the executor reads."""
 
     def __init__(self, step="0.00001", tick="0.01", min_qty="0.00001",
-                 min_notional="10", price="50000", free="10000"):
+                 min_notional="10", price="50000", free="10000",
+                 base_asset="BTC", quote_asset="USDT"):
         self._price, self._free = price, free
         self._info = {
+            "baseAsset": base_asset,
+            "quoteAsset": quote_asset,
             "filters": [
                 {"filterType": "LOT_SIZE", "stepSize": step,
                  "minQty": min_qty, "maxQty": "9000"},
@@ -478,6 +481,7 @@ class FakeFilters:
                 {"filterType": "NOTIONAL", "minNotional": min_notional},
             ]
         }
+        self.balance_calls: list[str] = []
 
     def get_symbol_info(self, symbol):
         return self._info
@@ -486,18 +490,83 @@ class FakeFilters:
         return {"price": self._price}
 
     def get_asset_balance(self, asset):
+        self.balance_calls.append(asset)
         return {"free": self._free}
 
     def ping(self):
         return {}
 
 
-def executor_with(client, **kwargs):
+def executor_with(client, symbol="BTCUSDT", **kwargs):
     from binance_executor import BinanceExecutor
-    executor = BinanceExecutor(symbol="BTCUSDT", env="testnet",
+    executor = BinanceExecutor(symbol=symbol, env="testnet",
                                api_key="k", api_secret="s", **kwargs)
     executor._client = client
     return executor
+
+
+# --- choosing the traded pair ----------------------------------------------
+
+
+def test_symbol_is_normalized_from_common_spellings():
+    from tradingagents.dataflows.vendors.binance_ohlcv import normalize_symbol
+    for spelling in ("ethusdt", " ETH-USDT ", "eth/usdt", "ETH_USDT"):
+        assert normalize_symbol(spelling) == "ETHUSDT"
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "BTC USDT", "BTC!", "ABC", "x" * 30])
+def test_malformed_symbols_are_refused_locally(bad):
+    """A typo must fail here, not as an opaque HTTP 400 several calls later."""
+    from tradingagents.dataflows.vendors.binance_ohlcv import normalize_symbol
+    with pytest.raises(ValueError):
+        normalize_symbol(bad)
+
+
+def test_symbol_falls_back_to_the_environment_then_to_btc(monkeypatch):
+    from tradingagents.dataflows.vendors.binance_ohlcv import (
+        DEFAULT_SYMBOL,
+        resolve_symbol,
+    )
+    monkeypatch.delenv("TRADING_SYMBOL", raising=False)
+    assert resolve_symbol() == DEFAULT_SYMBOL
+    monkeypatch.setenv("TRADING_SYMBOL", "solusdt")
+    assert resolve_symbol() == "SOLUSDT"
+    # An explicit argument always beats the environment.
+    assert resolve_symbol("ETHUSDT") == "ETHUSDT"
+
+
+def test_executor_picks_up_the_environment_symbol(monkeypatch):
+    monkeypatch.setenv("TRADING_SYMBOL", "ethusdt")
+    executor = executor_with(FakeFilters(base_asset="ETH"), symbol=None)
+    assert executor.symbol == "ETHUSDT"
+
+
+def test_base_and_quote_come_from_exchange_info_not_the_ticker():
+    """Slicing the ticker would mis-identify the assets on non-USDT pairs."""
+    client = FakeFilters(base_asset="SOL", quote_asset="FDUSD")
+    executor = executor_with(client, symbol="SOLFDUSD")
+    assert executor.base_asset == "SOL"
+    assert executor.quote_asset == "FDUSD"
+    executor.get_equity()
+    executor.get_position_quantity()
+    assert client.balance_calls == ["FDUSD", "SOL"]
+
+
+def test_non_usd_quoted_pair_is_refused():
+    """A $1,000 cap on ETHBTC would mean 1,000 BTC, so the pair is refused."""
+    from binance_executor import ExecutionRejected
+    executor = executor_with(
+        FakeFilters(base_asset="ETH", quote_asset="BTC"), symbol="ETHBTC"
+    )
+    with pytest.raises(ExecutionRejected, match="not a USD stablecoin"):
+        executor.load_filters()
+
+
+def test_backtest_cli_rejects_a_malformed_symbol(capsys, monkeypatch):
+    import run_1h_backtest
+    monkeypatch.delenv("TRADING_SYMBOL", raising=False)
+    assert run_1h_backtest.main(["--symbol", "NOT A PAIR"]) == 1
+    assert "Invalid --symbol" in capsys.readouterr().err
 
 
 def test_notional_is_hard_capped_at_1000_usd():
