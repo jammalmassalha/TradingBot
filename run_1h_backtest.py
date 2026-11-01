@@ -34,6 +34,7 @@ from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance_ohlcv import (
     compute_indicators,
     load_1h_ohlcv,
+    resolve_market,
     resolve_symbol,
 )
 from tradingagents.scalping.engine import BacktestConfig, run_backtest
@@ -64,6 +65,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="take-profit distance in ATR multiples")
     parser.add_argument("--fee-bps", type=float, default=10.0,
                         help="per-side fee in basis points of notional")
+    parser.add_argument("--market", default=None, choices=["spot", "futures"],
+                        help="spot candles or USD-M perp candles; "
+                             "defaults to $BINANCE_MARKET, else spot")
+    parser.add_argument("--leverage", type=float, default=None,
+                        help="futures only; widens the notional ceiling, not the risk")
+    parser.add_argument("--funding-bps", dest="funding_bps", type=float, default=1.0,
+                        help="futures only; funding paid per 8h, in bps of notional")
     parser.add_argument("--no-short", action="store_true",
                         help="long-only, matching a spot account that cannot short")
     parser.add_argument("--csv", type=Path, default=None,
@@ -93,8 +101,9 @@ def load_frame(args: argparse.Namespace) -> pd.DataFrame:
         frame = frame.sort_values("Date").reset_index(drop=True)
         return compute_indicators(frame)
 
-    print(f"Fetching {args.days} days of {args.symbol} 1H candles from Binance...")
-    return load_1h_ohlcv(symbol=args.symbol, days=args.days)
+    label = "USD-M perp" if args.market == "futures" else "spot"
+    print(f"Fetching {args.days} days of {args.symbol} 1H {label} candles from Binance...")
+    return load_1h_ohlcv(symbol=args.symbol, days=args.days, market=args.market)
 
 
 def confirm(prompt: str = APPROVAL_PROMPT) -> bool:
@@ -112,23 +121,33 @@ def confirm(prompt: str = APPROVAL_PROMPT) -> bool:
     return answer.strip().lower() == "y"
 
 
-def probe_binance(symbol: str, env: str | None) -> None:
+def probe_binance(
+    symbol: str,
+    env: str | None,
+    market: str = "spot",
+    leverage: float | None = None,
+) -> None:
     """Post-approval connectivity probe. Read-only: it places no orders."""
     try:
-        from binance_executor import BinanceExecutor, ExecutionRejected
+        from binance_executor import ExecutionRejected, build_executor
     except ImportError as exc:
         print(f"Execution bridge unavailable: {exc}")
         return
 
+    extra = {}
+    if market == "futures" and leverage:
+        extra["leverage"] = int(leverage)
     try:
-        executor = BinanceExecutor(symbol=symbol, env=env)
+        executor = build_executor(symbol=symbol, env=env, market=market, **extra)
     except ValueError as exc:
         print(f"Executor configuration error: {exc}")
         return
 
-    print(f"\nConnecting to Binance ({executor.env})...")
+    print(f"\nConnecting to Binance ({executor.env}, {executor.market})...")
     if executor.is_live:
         print("  *** LIVE ENVIRONMENT — orders would use real funds ***")
+    if market == "futures":
+        print("  *** LEVERAGED PERPETUALS — losses can exceed the margin posted ***")
     try:
         for key, value in executor.check_connectivity().items():
             print(f"  {key:>20}: {value}")
@@ -155,8 +174,15 @@ def main(argv: list[str] | None = None) -> int:
     # any fetch, so a typo fails here rather than as an HTTP 400.
     try:
         args.symbol = resolve_symbol(args.symbol)
+        args.market = resolve_market(args.market)
     except ValueError as exc:
-        print(f"Invalid --symbol: {exc}", file=sys.stderr)
+        print(f"Invalid configuration: {exc}", file=sys.stderr)
+        return 1
+
+    # Spot is the default everywhere, so a leveraged run has to be asked for
+    # twice: once for the data, once for the money.
+    if args.leverage and args.market != "futures":
+        print("--leverage requires --market futures", file=sys.stderr)
         return 1
 
     try:
@@ -165,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Could not load 1H data: {exc}", file=sys.stderr)
         return 1
 
+    is_futures = args.market == "futures"
     config = BacktestConfig(
         initial_balance=args.balance,
         risk_pct=args.risk_pct,
@@ -172,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         atr_target_multiple=args.atr_target,
         fee_bps=args.fee_bps,
         allow_short=not args.no_short,
+        leverage=args.leverage if is_futures and args.leverage else 1.0,
+        funding_bps_per_8h=args.funding_bps if is_futures else 0.0,
     )
 
     try:
@@ -193,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Not approved — exiting without connecting to Binance.")
         sys.exit(0)
 
-    probe_binance(args.symbol, args.env)
+    probe_binance(args.symbol, args.env, args.market, args.leverage)
     return 0
 
 

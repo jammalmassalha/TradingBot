@@ -421,6 +421,32 @@ python binance_executor.py --check --symbol SOLUSDT    # a different pair
 python binance_executor.py --dry-run BUY --quantity 0.01 --stop-price 58000
 ```
 
+### Perpetual futures (USD-M)
+
+Spot is the default. To trade perpetuals set the market, the leverage and the margin mode:
+
+```bash
+BINANCE_MARKET=futures
+BINANCE_LEVERAGE=7          # clamped to 10x in code
+BINANCE_MARGIN_MODE=CROSSED
+BINANCE_MARGIN_FRACTION=0.20
+```
+
+```bash
+python run_1h_backtest.py --market futures --leverage 7   # perp candles + funding
+python binance_executor.py --check --market futures       # futures wallet probe
+```
+
+The futures path differs from spot in ways that matter:
+
+- **Equity no longer bounds notional.** The margin fraction bounds what share of the wallet a position may post, and leverage turns that into notional: `notional = wallet x fraction x leverage`. Applying the spot rule instead would make a small wallet untradeable (20% of 13 USDT is 2.60, below every venue minimum).
+- **`SELL` still means close**, as on spot. Opening a short requires the explicit `SHORT` action, so an agent emitting `SELL` to mean "exit" can never be read as "open a leveraged short".
+- **A stop beyond the liquidation price is refused.** Past that point the venue closes the position first, at a worse price, so the risk the sizing assumed is fiction.
+- **Brackets use `STOP_MARKET` with `closePosition=true`, triggered on mark price**, so one fill cancels the sibling and a thin-book wick cannot pick off the stop.
+- **The backtest charges funding** (`--funding-bps`, default 1 bp per 8h) to whichever side holds the position. The rate flips with the market, so the gate assumes the unfavourable regime rather than modelling carry income.
+
+`--check` reports `tradable: yes|no` and the smallest order the venue will accept, because on a small wallet one minimum lot is often worth more than the entire buying power — otherwise that only surfaces as a rejected order later.
+
 ### Choosing the coin
 
 Set `TRADING_SYMBOL` in `.env` to change the pair everywhere, or pass `--symbol` to override it for a single run. The name is normalized, so `eth-usdt` and `ETHUSDT` are the same pair, and a malformed ticker fails immediately instead of as an opaque HTTP 400.
