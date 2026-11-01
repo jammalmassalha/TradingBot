@@ -31,6 +31,8 @@ from typing import Any, Protocol
 
 import pandas as pd
 
+from tradingagents.dataflows.vendors.binance_ohlcv import DEFAULT_SYMBOL
+
 logger = logging.getLogger(__name__)
 
 
@@ -201,7 +203,7 @@ class AgentBiasModel:
     """
 
     graph: Any
-    symbol: str = "BTCUSDT"
+    symbol: str = DEFAULT_SYMBOL
     asset_type: str = "crypto"
 
     def bias_for(self, frame: pd.DataFrame, index: int) -> StrategicBias:

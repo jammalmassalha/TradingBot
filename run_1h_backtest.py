@@ -15,7 +15,8 @@ the metrics. The agents supply direction live; this proves the machinery that
 direction flows through.
 
 Examples:
-    python run_1h_backtest.py                       # 60 days of BTCUSDT 1H
+    python run_1h_backtest.py                       # 60 days of $TRADING_SYMBOL 1H
+    python run_1h_backtest.py --symbol ETHUSDT      # override the pair
     python run_1h_backtest.py --days 30 --yes       # non-interactive
     python run_1h_backtest.py --csv bars.csv        # offline, from a saved frame
 """
@@ -33,6 +34,7 @@ from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.binance_ohlcv import (
     compute_indicators,
     load_1h_ohlcv,
+    resolve_symbol,
 )
 from tradingagents.scalping.engine import BacktestConfig, run_backtest
 from tradingagents.scalping.metrics import render_report
@@ -48,7 +50,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="1H backtest and Binance approval gate",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--symbol", default=None,
+                        help="pair to trade; defaults to $TRADING_SYMBOL, else BTCUSDT")
     parser.add_argument("--days", type=int, default=60,
                         help="days of 1H history to replay (30-60 recommended)")
     parser.add_argument("--balance", type=float, default=10_000.0,
@@ -147,6 +150,14 @@ def main(argv: list[str] | None = None) -> int:
         load_dotenv()
     except ImportError:
         pass
+
+    # Resolved after .env is loaded so TRADING_SYMBOL is visible, and before
+    # any fetch, so a typo fails here rather than as an HTTP 400.
+    try:
+        args.symbol = resolve_symbol(args.symbol)
+    except ValueError as exc:
+        print(f"Invalid --symbol: {exc}", file=sys.stderr)
+        return 1
 
     try:
         frame = load_frame(args)

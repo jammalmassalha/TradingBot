@@ -22,6 +22,8 @@ in ``binance_executor.py`` and is kept strictly out of this file.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -52,6 +54,51 @@ HOUR_FORMAT = "%Y-%m-%d %H:00:00 UTC"
 
 # Column order every consumer of this module can rely on.
 OHLCV_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+
+# The pair traded when nothing else is specified. Every entry point in the 1H
+# pipeline defaults to ``resolve_symbol()`` rather than to this constant
+# directly, so a single ``TRADING_SYMBOL`` in .env changes the coin everywhere
+# instead of having to be repeated on each command.
+DEFAULT_SYMBOL = "BTCUSDT"
+SYMBOL_ENV_VAR = "TRADING_SYMBOL"
+
+# Binance pair tickers are concatenated uppercase alphanumerics (BTCUSDT,
+# 1INCHUSDT). Validating the shape here turns a typo into an immediate local
+# error instead of a confusing HTTP 400 several calls later.
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{4,24}$")
+
+
+def normalize_symbol(symbol: str) -> str:
+    """``symbol`` uppercased and validated as a Binance pair ticker.
+
+    Accepts the common hyphenated spellings (``BTC-USDT``, ``btc/usdt``) that
+    other venues use, because a user who sets one of those in .env should get
+    the pair they meant rather than a rejected request.
+    """
+    if not isinstance(symbol, str):
+        raise ValueError(f"symbol must be a string, got {type(symbol).__name__}")
+    cleaned = symbol.strip().upper().replace("-", "").replace("/", "").replace("_", "")
+    if not _SYMBOL_PATTERN.match(cleaned):
+        raise ValueError(
+            f"{symbol!r} is not a valid Binance pair ticker; expected a form "
+            f"like BTCUSDT or ETHUSDT"
+        )
+    return cleaned
+
+
+def resolve_symbol(symbol: str | None = None) -> str:
+    """The pair to trade: an explicit argument, else ``TRADING_SYMBOL``, else BTCUSDT.
+
+    An explicit argument always wins so that a ``--symbol`` flag can override
+    the environment for a one-off run without editing .env.
+    """
+    if symbol:
+        return normalize_symbol(symbol)
+    from_env = os.getenv(SYMBOL_ENV_VAR, "").strip()
+    if from_env:
+        return normalize_symbol(from_env)
+    return DEFAULT_SYMBOL
+
 
 # Indicator parameters. Centralized so the backtest, the executor and the
 # agent-facing report all size positions off exactly the same ATR.
@@ -125,17 +172,21 @@ def _request_klines(symbol: str, interval: str, start_ms: int, limit: int) -> li
 
 
 def fetch_klines(
-    symbol: str = "BTCUSDT",
+    symbol: str | None = None,
     interval: str = "1h",
     days: int = 60,
     end: datetime | None = None,
 ) -> pd.DataFrame:
     """``days`` of ``interval`` candles for ``symbol``, oldest first.
 
+    ``symbol`` defaults to ``TRADING_SYMBOL`` from the environment, falling
+    back to BTCUSDT.
+
     Pages through the 1000-row response cap until the window is covered. Only
     bars that have *closed* are returned: the in-progress candle has a moving
     close that would let a backtest trade on a price that never settled.
     """
+    symbol = resolve_symbol(symbol)
     if days < 1:
         raise ValueError(f"days must be at least 1, got {days}")
 
@@ -267,17 +318,21 @@ def compute_indicators(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_1h_ohlcv(
-    symbol: str = "BTCUSDT",
+    symbol: str | None = None,
     days: int = 60,
     end: datetime | None = None,
     with_indicators: bool = True,
 ) -> pd.DataFrame:
     """The 1H bar series for ``symbol``, indicators attached, oldest first.
 
+    ``symbol`` defaults to ``TRADING_SYMBOL`` from the environment, falling
+    back to BTCUSDT.
+
     This is the single entry point the strategic (agent) and tactical
     (backtest/executor) layers should both call, so they cannot drift onto
     differently-parameterized ATRs.
     """
+    symbol = resolve_symbol(symbol)
     frame = fetch_klines(symbol=symbol, interval="1h", days=days, end=end)
     return compute_indicators(frame) if with_indicators else frame
 
@@ -289,12 +344,13 @@ def latest_bar(frame: pd.DataFrame) -> pd.Series:
     return frame.iloc[-1]
 
 
-def render_1h_report(frame: pd.DataFrame, symbol: str = "BTCUSDT", bars: int = 12) -> str:
+def render_1h_report(frame: pd.DataFrame, symbol: str | None = None, bars: int = 12) -> str:
     """A compact text snapshot of the 1H state for an LLM analyst prompt.
 
     Kept to the last ``bars`` rows and rounded: the strategic layer needs the
     current regime, not a thousand rows of history it would pay tokens to read.
     """
+    symbol = resolve_symbol(symbol)
     if frame.empty:
         return f"No 1H market data available for {symbol}."
 

@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from tradingagents.dataflows.vendors.binance_ohlcv import format_hour
+from tradingagents.dataflows.vendors.binance_ohlcv import DEFAULT_SYMBOL, format_hour
 from tradingagents.scalping.metrics import PerformanceMetrics, compute_metrics
 from tradingagents.scalping.signals import Bias, BiasModel, StrategicBias
 
@@ -222,7 +222,7 @@ def run_backtest(
     frame: pd.DataFrame,
     bias_model: BiasModel,
     config: BacktestConfig | None = None,
-    symbol: str = "BTCUSDT",
+    symbol: str = DEFAULT_SYMBOL,
 ) -> BacktestOutcome:
     """Replay ``frame`` bar by bar under ``bias_model`` and the account rules."""
     config = config or BacktestConfig()

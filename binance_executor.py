@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any
 
+from tradingagents.dataflows.vendors.binance_ohlcv import resolve_symbol
+
 logger = logging.getLogger("binance_executor")
 
 # --- Hardcoded safety envelope. Not read from config, by design. -------------
@@ -48,6 +50,15 @@ MAX_TRADE_NOTIONAL_USD = Decimal("1000")
 MAX_EQUITY_FRACTION = Decimal("0.20")
 
 TESTNET_REST_URL = "https://testnet.binance.vision/api"
+
+# The notional cap above is denominated in US dollars, and that cap only means
+# anything if the pair's quote asset is worth roughly a dollar. On ETHBTC a
+# "1000" cap would mean 1000 BTC, so pairs quoted in anything but a USD-pegged
+# stablecoin are refused rather than silently handed a millionfold wider
+# envelope. Add to this set only after checking the peg.
+USD_QUOTE_ASSETS = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "USD"})
+
+# Fallback quote asset, used only before exchangeInfo has been read.
 QUOTE_ASSET = "USDT"
 
 
@@ -65,6 +76,8 @@ class SymbolFilters:
     max_qty: Decimal
     tick_size: Decimal
     min_notional: Decimal
+    base_asset: str = ""
+    quote_asset: str = ""
 
     def normalize_quantity(self, quantity: Decimal) -> Decimal:
         """``quantity`` truncated down to a whole number of lot steps."""
@@ -116,12 +129,12 @@ class BinanceExecutor:
 
     def __init__(
         self,
-        symbol: str = "BTCUSDT",
+        symbol: str | None = None,
         env: str | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
     ) -> None:
-        self.symbol = symbol.upper()
+        self.symbol = resolve_symbol(symbol)
         self.env = (env or os.getenv("BINANCE_ENV") or "testnet").strip().lower()
         if self.env not in ("testnet", "live"):
             raise ValueError(f"BINANCE_ENV must be 'testnet' or 'live', got {self.env!r}")
@@ -177,6 +190,20 @@ class BinanceExecutor:
         # on the symbol and environment, so both are accepted.
         notional = by_type.get("NOTIONAL") or by_type.get("MIN_NOTIONAL") or {}
 
+        # Base and quote come from exchangeInfo rather than from slicing the
+        # ticker: "BTCUSDT".removesuffix("USDT") only works for USDT pairs, and
+        # guessing wrong would read the balance of an asset that is not the one
+        # being traded.
+        quote_asset = str(info.get("quoteAsset") or "").upper()
+        base_asset = str(info.get("baseAsset") or "").upper()
+        if quote_asset and quote_asset not in USD_QUOTE_ASSETS:
+            raise ExecutionRejected(
+                f"{self.symbol} is quoted in {quote_asset}, which is not a USD "
+                f"stablecoin; the ${MAX_TRADE_NOTIONAL_USD} notional cap would "
+                f"not mean dollars. Use a USD-quoted pair "
+                f"({', '.join(sorted(USD_QUOTE_ASSETS))})."
+            )
+
         self._filters = SymbolFilters(
             symbol=self.symbol,
             step_size=_decimal(lot.get("stepSize"), "0.00000001"),
@@ -184,6 +211,8 @@ class BinanceExecutor:
             max_qty=_decimal(lot.get("maxQty"), "9" * 12),
             tick_size=_decimal(price.get("tickSize"), "0.01"),
             min_notional=_decimal(notional.get("minNotional"), "0"),
+            base_asset=base_asset,
+            quote_asset=quote_asset,
         )
         logger.info(
             "%s filters: step=%s tick=%s minQty=%s minNotional=%s",
@@ -205,23 +234,38 @@ class BinanceExecutor:
     def get_equity(self) -> Decimal:
         """Free quote-asset balance, used as the equity base for the 20% cap.
 
+        The quote asset comes from exchangeInfo, so a USDC- or FDUSD-quoted
+        pair reads the balance it is actually settled in.
+
         Only the free balance counts: funds already committed to a resting
         order cannot back a new one, and counting them would let the cap be
         breached across several open orders.
         """
+        asset = self.quote_asset
         try:
-            balance = self.client.get_asset_balance(asset=QUOTE_ASSET)
+            balance = self.client.get_asset_balance(asset=asset)
         except ExecutionRejected:
             raise
         except Exception as exc:
-            raise ExecutionRejected(f"could not read the {QUOTE_ASSET} balance: {exc}") from exc
+            raise ExecutionRejected(f"could not read the {asset} balance: {exc}") from exc
         if not balance:
             return Decimal("0")
         return _decimal(balance.get("free"))
 
+    @property
+    def base_asset(self) -> str:
+        """The asset being bought and sold, per exchangeInfo."""
+        filters = self.load_filters()
+        return filters.base_asset or self.symbol.removesuffix(filters.quote_asset or QUOTE_ASSET)
+
+    @property
+    def quote_asset(self) -> str:
+        """The asset the pair is priced and settled in, per exchangeInfo."""
+        return self.load_filters().quote_asset or QUOTE_ASSET
+
     def get_position_quantity(self, base_asset: str | None = None) -> Decimal:
         """Free balance of the base asset — the spot position that can be sold."""
-        asset = base_asset or self.symbol.removesuffix(QUOTE_ASSET)
+        asset = base_asset or self.base_asset
         try:
             balance = self.client.get_asset_balance(asset=asset)
         except ExecutionRejected:
@@ -502,7 +546,10 @@ class BinanceExecutor:
             "min_notional": _format(filters.min_notional),
         }
         report["price"] = _format(self.get_price())
-        report["equity_usdt"] = _format(self.get_equity())
+        report["base_asset"] = filters.base_asset or self.base_asset
+        report["quote_asset"] = filters.quote_asset or QUOTE_ASSET
+        report["equity_quote"] = _format(self.get_equity())
+        report["position_base"] = _format(self.get_position_quantity())
         report["max_trade_notional"] = _format(
             self.cap_notional(MAX_TRADE_NOTIONAL_USD, self._equity_or_none())
         )
@@ -511,7 +558,8 @@ class BinanceExecutor:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Binance execution bridge (guarded)")
-    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--symbol", default=None,
+                        help="pair to trade; defaults to $TRADING_SYMBOL, else BTCUSDT")
     parser.add_argument("--env", default=None, choices=["testnet", "live"])
     parser.add_argument("--check", action="store_true",
                         help="probe connectivity and print filters; places no order")
